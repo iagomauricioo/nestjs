@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { Response } from 'express';
 
 describe('AppController', () => {
   let appController: AppController;
@@ -15,8 +16,15 @@ describe('AppController', () => {
   });
 
   describe('root', () => {
-    it('should return "Hello World!!!!"', () => {
-      expect(appController.getHello()).toBe('Hello World!');
+    it('should render the API home page', () => {
+      const send = jest.fn();
+      const response = { send } as unknown as Response;
+
+      appController.getHome(response);
+
+      expect(send).toHaveBeenCalledWith(
+        expect.stringContaining('<title>API Oceanos de Plástico</title>'),
+      );
     });
   });
 });
