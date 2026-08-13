@@ -4,45 +4,163 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-lightsail
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    name: Validar e implantar
     runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
 
     steps:
-      - name: Clonar o código
-        uses: actions/checkout@v3
-
-      - name: Configurar Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: Configurar SSH
+      - name: Configurar e validar SSH
+        shell: bash
+        env:
+          LIGHTSAIL_IP: ${{ secrets.LIGHTSAIL_IP }}
+          LIGHTSAIL_SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.LIGHTSAIL_SSH_KEY }}" > ~/.ssh/github_actions_rsa
-          chmod 600 ~/.ssh/github_actions_rsa
-          eval $(ssh-agent -s)
-          ssh-add ~/.ssh/github_actions_rsa
-          ssh-keyscan -H ${{ secrets.LIGHTSAIL_IP }} >> ~/.ssh/known_hosts
+          set -Eeuo pipefail
 
-      - name: Verificar chave SSH
-        run: |
-          echo "Conteúdo da chave SSH:"
-          cat ~/.ssh/github_actions_rsa
+          if [[ -z "${LIGHTSAIL_IP}" ]]; then
+            echo "::error::O secret LIGHTSAIL_IP não foi configurado."
+            exit 1
+          fi
 
-      - name: Deploy no Lightsail
+          if [[ -z "${LIGHTSAIL_SSH_KEY}" ]]; then
+            echo "::error::O secret LIGHTSAIL_SSH_KEY não foi configurado."
+            exit 1
+          fi
+
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${LIGHTSAIL_SSH_KEY}" > "${HOME}/.ssh/github_actions_rsa"
+          chmod 600 "${HOME}/.ssh/github_actions_rsa"
+
+          if ! ssh-keygen -y -f "${HOME}/.ssh/github_actions_rsa" > /dev/null; then
+            echo "::error::LIGHTSAIL_SSH_KEY não contém uma chave privada SSH válida."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if ssh-keyscan -T 10 -H "${LIGHTSAIL_IP}" > "${HOME}/.ssh/known_hosts" 2>/dev/null; then
+              break
+            fi
+
+            if [[ "${attempt}" == 3 ]]; then
+              echo "::error::Não foi possível alcançar o SSH em ${LIGHTSAIL_IP}:22. Verifique IP, instância, serviço SSH e firewall do Lightsail."
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          chmod 600 "${HOME}/.ssh/known_hosts"
+
+          ssh \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o IdentitiesOnly=yes \
+            -i "${HOME}/.ssh/github_actions_rsa" \
+            "root@${LIGHTSAIL_IP}" true
+
+      - name: Deploy controlado no Lightsail
+        shell: bash
+        env:
+          LIGHTSAIL_IP: ${{ secrets.LIGHTSAIL_IP }}
         run: |
-          ssh -o ConnectTimeout=10 -i ~/.ssh/github_actions_rsa root@${{ secrets.LIGHTSAIL_IP }} << 'EOF'
-          set -e
-          export SHELL=/bin/bash
-          echo "Diretório atual: $(pwd)"
-      
-          # Acessa o diretório do projeto
-          cd ~/nestjs || { echo "Falha ao acessar o diretório ~/nestjs"; exit 1; }
-      
-          # Atualiza o código
-          git pull origin master || { echo "Falha ao fazer git pull"; exit 1; }
-      
+          set -Eeuo pipefail
+
+          ssh \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o IdentitiesOnly=yes \
+            -i "${HOME}/.ssh/github_actions_rsa" \
+            "root@${LIGHTSAIL_IP}" 'bash -se' <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          readonly PROJECT_DIR="${HOME}/nestjs"
+          readonly PROCESS_NAME="nestjs"
+          readonly HEALTH_URL="http://127.0.0.1:8080/"
+
+          cd "${PROJECT_DIR}"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Deploy abortado: existem alterações não commitadas em ${PROJECT_DIR}."
+            exit 1
+          fi
+
+          previous_commit="$(git rev-parse HEAD)"
+
+          rollback() {
+            local exit_code=$?
+
+            if [[ "${exit_code}" -eq 0 ]]; then
+              return
+            fi
+
+            trap - ERR
+            echo "Deploy falhou. Restaurando o commit ${previous_commit}."
+            git checkout --detach "${previous_commit}"
+            npm ci
+            npm run build
+
+            if pm2 describe "${PROCESS_NAME}" > /dev/null 2>&1; then
+              pm2 restart "${PROCESS_NAME}" --update-env
+            else
+              pm2 start npm --name "${PROCESS_NAME}" -- run start:prod
+            fi
+
+            exit "${exit_code}"
+          }
+
+          trap rollback ERR
+
+          git checkout master
+          git pull --ff-only origin master
+          npm ci
+          npm run build
+
+          if ! command -v pm2 > /dev/null 2>&1; then
+            echo "Deploy abortado: PM2 não está instalado no servidor."
+            exit 1
+          fi
+
+          if pm2 describe "${PROCESS_NAME}" > /dev/null 2>&1; then
+            pm2 restart "${PROCESS_NAME}" --update-env
+          else
+            pm2 start npm --name "${PROCESS_NAME}" -- run start:prod
+          fi
+
+          process_pid="$(pm2 pid "${PROCESS_NAME}")"
+          if [[ ! "${process_pid}" =~ ^[1-9][0-9]*$ ]]; then
+            pm2 logs "${PROCESS_NAME}" --lines 80 --nostream
+            echo "O processo ${PROCESS_NAME} não ficou online no PM2."
+            false
+          fi
+
+          healthy=false
+          for attempt in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error --max-time 5 "${HEALTH_URL}" > /dev/null; then
+              healthy=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [[ "${healthy}" != true ]]; then
+            pm2 logs "${PROCESS_NAME}" --lines 80 --nostream
+            echo "Health check falhou em ${HEALTH_URL}."
+            false
+          fi
+
+          pm2 save
+          trap - ERR
+          echo "Deploy concluído no commit $(git rev-parse HEAD)."
+          REMOTE_SCRIPT
