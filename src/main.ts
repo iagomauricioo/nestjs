@@ -2,14 +2,10 @@ import { NestFactory } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import * as basicAuth from 'express-basic-auth';
-import * as fs from 'fs';
-import * as path from 'path';
+import { getHttpsOptions } from './config/https-options';
 
 async function bootstrap() {
-  const httpsOptions = {
-    key: fs.readFileSync(path.join(__dirname, '..', 'ssl', 'key.pem')),
-    cert: fs.readFileSync(path.join(__dirname, '..', 'ssl', 'cert.pem')),
-  };
+  const httpsOptions = getHttpsOptions(process.env);
 
   const app = await NestFactory.create(AppModule, { httpsOptions });
 
@@ -22,9 +18,18 @@ async function bootstrap() {
     );
   }
 
+  const allowedOrigins = (process.env.URL_CORS ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (allowedOrigins.length === 0) {
+    throw new Error('URL_CORS não foi definido no ambiente');
+  }
+
   app.enableCors({
-    origin: '*',
-    methods: '*',
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   });
 
   app.use(
@@ -58,4 +63,5 @@ async function bootstrap() {
 // Inicia a aplicação e captura erros
 bootstrap().catch((error) => {
   console.error('Error during bootstrap:', error);
+  process.exitCode = 1;
 });

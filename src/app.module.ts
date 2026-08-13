@@ -27,7 +27,7 @@ import { InstituicaoModule } from './instituicao/instituicao.module';
         password: configService.get('DB_PASSWORD'),
         database: configService.get('DB_NAME'),
         autoLoadEntities: true,
-        synchronize: true, // DO NOT USE IN PRODUCTION
+        synchronize: configService.get('DB_SYNCHRONIZE', 'false') === 'true',
         entities: [Colaborador],
         migrations: ['dist/migrations/*.js'],
         migrationsTableName: 'migrations_typeorm',
